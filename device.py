@@ -7,19 +7,29 @@ import json
 import os
 import ssl
 import time
+
 import strand
 import jwt
 import paho.mqtt.client as mqtt
 import multiprocessing
+import sys
 
-DEBUG = False
+DEBUG = True
+
+MAXIMUM_BACKOFF_TIME = 32
+
+jwt_exp_mins = 1440
+should_backoff = False
+client_connected = False
+
+
 
 
 def create_jwt(project_id, private_key_file, algorithm):
     """Create a JWT (https://jwt.io) to establish an MQTT connection."""
     token = {
         'iat': datetime.datetime.utcnow(),
-        'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=60),
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(minutes=jwt_exp_mins),
         'aud': project_id
     }
     with open(private_key_file, 'r') as f:
@@ -84,58 +94,64 @@ class Device(object):
         Process.led_pattern_process = multiprocessing.Process(target=self.ledpattern.off)
         Process.led_pattern_process.start()
 
-    def wait_for_connection(self, timeout):
-        """Wait for the device to become connected."""
-        total_time = 0
-        while not self.connected and total_time < timeout:
-            time.sleep(1)
-            total_time += 1
+def wait_for_connection(timeout):
+    """Wait for the device to become connected."""
+    total_time = 0
+    connected = False
+    while not connected and total_time < timeout:
+        time.sleep(1)
+        total_time += 1
 
-        if not self.connected:
-            raise RuntimeError('Could not connect to MQTT bridge.')
+    if not connected:
+        raise RuntimeError('Could not connect to MQTT bridge.')
 
-    def on_connect(self, unused_client, unused_userdata, unused_flags, rc):
-        """Callback for when a device connects."""
-        print('Connection Result:', error_str(rc))
-        self.connected = True
+def on_connect(unused_client, unused_userdata, unused_flags, rc):
+    """Callback for when a device connects."""
+    print('Connection Result:', error_str(rc))
 
-    def on_disconnect(self, unused_client, unused_userdata, rc):
-        """Callback for when a device disconnects."""
-        print('Disconnected:', error_str(rc))
-        self.connected = False
+def on_disconnect(client, userdata, rc):
+    """Callback for when a device disconnects."""
+    print('Disconnected: {} {}', error_str(rc), userdata)
+    client_connected = False
+    client.loop_stop()
 
-    def on_publish(self, unused_client, unused_userdata, unused_mid):
-        """Callback when the device receives a PUBACK from the MQTT bridge."""
-        if DEBUG:
-            print('Published message acked.')
 
-    def on_subscribe(self, unused_client, unused_userdata, unused_mid,
-                     granted_qos):
-        """Callback when the device receives a SUBACK from the MQTT bridge."""
-        print('Subscribed: ', granted_qos)
-        if granted_qos[0] == 128:
-            print('Subscription failed.')
+def on_publish(unused_client, unused_userdata, unused_mid):
+    """Callback when the device receives a PUBACK from the MQTT bridge."""
+    if DEBUG:
+        print('Published message acked.')
 
-    def on_message(self, unused_client, unused_userdata, message):
-        """Callback when the device receives a message on a subscription."""
-        payload = message.payload
-        print('Received message \'{}\' on topic \'{}\' with Qos {}'.format(
-            payload, message.topic, str(message.qos)))
+def on_subscribe(unused_client, unused_userdata, unused_mid,
+                 granted_qos):
+    """Callback when the device receives a SUBACK from the MQTT bridge."""
+    print('Subscribed: ', granted_qos)
+    if granted_qos[0] == 128:
+        print('Subscription failed.')
 
-        # The device will receive its latest config when it subscribes to the
-        # config topic. If there is no configuration for the device, the device
-        # will receive a config with an empty payload.
-        if not payload:
-            return
+def on_message(unused_client, unused_userdata, message):
+    """Callback when the device receives a message on a subscription."""
+    payload = message.payload
+    print('Received message \'{}\' on topic \'{}\' with Qos {}'.format(
+        payload, message.topic, str(message.qos)))
 
-        # The config is passed in the payload of the message. In this example,
-        # the server sends a serialized JSON string.
-        data = json.loads(payload)
+    # The device will receive its latest config when it subscribes to the
+    # config topic. If there is no configuration for the device, the device
+    # will receive a config with an empty payload.
+    if not payload:
+        return
 
-        if data['led_on']:
-            Device.led_start(self, data['pattern'])
-        elif not data['led_on']:
-            Device.led_stop(self)
+    # The config is passed in the payload of the message. In this example,
+    # the server sends a serialized JSON string.
+    data = json.loads(payload)
+    device = Device()
+    if data['led_on']:
+        Device.led_start(device, data['pattern'])
+    elif not data['led_on']:
+        Device.led_stop(device)
+
+def on_log(client, userdata, level, buf):
+    print("{} Client log: {}", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f"), buf)
+
 
 
 
@@ -189,80 +205,105 @@ def parse_command_line_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_command_line_args()
-
-    # Create the MQTT client and connect to Cloud IoT.
+def get_client(
+        project_id, cloud_region, registry_id, device_id, private_key_file,
+        algorithm, ca_certs, mqtt_bridge_hostname, mqtt_bridge_port):
+    """Create our MQTT client. The client_id is a unique string that identifies
+    this device. For Google Cloud IoT Core, it must be in the format below."""
     client = mqtt.Client(
-        client_id='projects/{}/locations/{}/registries/{}/devices/{}'.format(
-            args.project_id,
-            args.cloud_region,
-            args.registry_id,
-            args.device_id))
+            client_id=('projects/{}/locations/{}/registries/{}/devices/{}'
+                       .format(
+                               project_id,
+                               cloud_region,
+                               registry_id,
+                               device_id)))
+
+    # With Google Cloud IoT Core, the username field is ignored, and the
+    # password field is used to transmit a JWT to authorize the device.
     client.username_pw_set(
-        username='unused',
-        password=create_jwt(
-            args.project_id,
-            args.private_key_file,
-            args.algorithm))
-    client.tls_set(ca_certs=args.ca_certs, tls_version=ssl.PROTOCOL_TLSv1_2)
+            username='unused',
+            password=create_jwt(
+                    project_id, private_key_file, algorithm))
 
-    device = Device()
+    # Enable SSL/TLS support.
+    client.tls_set(ca_certs=ca_certs, tls_version=ssl.PROTOCOL_TLSv1_2)
 
-    device.jwtIssued = datetime.datetime.utcnow()
+    # Register message callbacks. https://eclipse.org/paho/clients/python/docs/
+    # describes additional callbacks that Paho supports. In this example, the
+    # callbacks just print to standard out.
+    client.on_connect = on_connect
+    client.on_publish = on_publish
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    client.on_log = on_log
 
-    client.on_connect = device.on_connect
-    client.on_publish = device.on_publish
-    client.on_disconnect = device.on_disconnect
-    client.on_subscribe = device.on_subscribe
-    client.on_message = device.on_message
-
-    client.connect(args.mqtt_bridge_hostname, args.mqtt_bridge_port)
-
-    client.loop_start()
-
-    # This is the topic that the device will publish telemetry events
-    # (temperature data) to.
-    mqtt_telemetry_topic = '/devices/{}/events'.format(args.device_id)
+    # Connect to the Google MQTT bridge.
+    client.connect(mqtt_bridge_hostname, mqtt_bridge_port)
 
     # This is the topic that the device will receive configuration updates on.
-    mqtt_config_topic = '/devices/{}/config'.format(args.device_id)
-
-    # Wait up to 5 seconds for the device to connect.
-    device.wait_for_connection(5)
+    mqtt_config_topic = '/devices/{}/config'.format(device_id)
 
     # Subscribe to the config topic.
     client.subscribe(mqtt_config_topic, qos=1)
 
+    return client
+
+
+def main():
+    args = parse_command_line_args()
+
+    global minimum_backoff_time
+
+    mqtt_telemetry_topic = '/devices/{}/state'.format(args.device_id)
+
+    # This is the topic that the device will receive configuration updates on.
+    mqtt_config_topic = '/devices/{}/config'.format(args.device_id)
+
+    jwtIssued = datetime.datetime.utcnow()
+    client = get_client(
+        args.project_id, args.cloud_region, args.registry_id, args.device_id,
+        args.private_key_file, args.algorithm, args.ca_certs,
+        args.mqtt_bridge_hostname, args.mqtt_bridge_port)
+
+    # Publish num_messages mesages to the MQTT bridge once per second.
     while True:
+        # Process network events.
+        client.loop_start()
 
-        device.get_status()
+        # Wait if backoff is required.
+        if should_backoff:
+            # If backoff time is too large, give up.
+            if minimum_backoff_time > MAXIMUM_BACKOFF_TIME:
+                print('Exceeded maximum backoff time. Giving up.')
+                break
 
-        #Check on when the JWT was issued.
-        if DEBUG:
-            print("JWT Issued: {}".format(device.jwtIssued))
-        seconds_since_issue = (datetime.datetime.utcnow() - device.jwtIssued).seconds
-        if seconds_since_issue > 60 * 60:
+            # Otherwise, wait and connect again.
+            delay = minimum_backoff_time + time.random.randint(0, 1000) / 1000.0
+            print('Waiting for {} before reconnecting.'.format(delay))
+            time.sleep(delay)
+            minimum_backoff_time *= 2
+            client.connect(args.mqtt_bridge_hostname, args.mqtt_bridge_port)
+
+        seconds_since_issue = (datetime.datetime.utcnow() - jwtIssued).seconds
+        if seconds_since_issue > 60 * jwt_exp_mins:
             print('Refreshing token after {}s').format(seconds_since_issue)
-            client.username_pw_set(
-                username='unused',
-                password=create_jwt(
-                    args.project_id,
-                    args.private_key_file,
-                    args.algorithm))
-            device.jwtIssued = datetime.datetime.utcnow()
+            client.loop_stop()
+            jwtIssued = datetime.datetime.utcnow()
+            client = get_client(
+                args.project_id, args.cloud_region,
+                args.registry_id, args.device_id, args.private_key_file,
+                args.algorithm, args.ca_certs, args.mqtt_bridge_hostname,
+                args.mqtt_bridge_port)
 
-        payload = json.dumps({
-            'led_on': device.led_on,
-            'pattern': device.pattern,
-            'error': device.error,
-            'errormsg': device.errormsg
-        })
-        if DEBUG:
-            print('Publishing payload', payload)
-        client.publish(mqtt_telemetry_topic, payload, qos=1)
-        # Send events every second.
+        # Send events every second. State should not be updated as often
         time.sleep(5)
+
+    print('Finished.')
+
+    # Subscribe to the config topic.
+    client.subscribe(mqtt_config_topic, qos=1)
+
+
 
     client.disconnect()
     client.loop_stop()
