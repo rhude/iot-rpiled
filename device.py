@@ -12,17 +12,23 @@ import strand
 import jwt
 import paho.mqtt.client as mqtt
 import multiprocessing
-import sys
+import urllib.request
+import logging
 
+logging.basicConfig(level="DEBUG")
 DEBUG = True
 
 MAXIMUM_BACKOFF_TIME = 32
 
-jwt_exp_mins = 1440
+MAX_TIME_BETWEEN_ACKS = 60
+
+STRAND_URL = "http://localhost:5000"
+
+jwt_exp_mins = 240
 should_backoff = False
 client_connected = False
 
-
+led_pattern_process = None
 
 
 def create_jwt(project_id, private_key_file, algorithm):
@@ -43,7 +49,13 @@ def error_str(rc):
     """Convert a Paho error to a human readable string."""
     return '{}: {}'.format(rc, mqtt.error_string(rc))
 
+def merge_dicts(x, y):
+    z = x.copy()   # start with x's keys and values
+    z.update(y)    # modifies z with y's keys and values & returns None
+    return z
+
 class Process(object):
+    global led_pattern_process
     led_pattern_process = multiprocessing.Process()
 
 
@@ -57,42 +69,76 @@ class Device(object):
         self.error = False
         self.errormsg = None
 
-        self.jwtIssued = None
-
-        self.ledpattern = strand.Pattern()
-        global led_pattern_process
+        self.device_id = None
+        self.mqtt_telemetry_topic = "state"
+        self.registry_id = None
+        self.lastack = datetime.datetime.utcnow()
 
 
     def get_status(self):
-        if DEBUG:
-            print('Refreshing device status...')
+        logging.debug('Refreshing device status...')
+        return_status = {}
+        latest_status = {
+            "deviceId": self.device_id,
+            "registryId": self.registry_id,
+            "lastResultStatus": None,
+            "pattern": None,
+            "led_on": None
+        }
+        try:
+            data = urllib.request.urlopen("{}/status".format(STRAND_URL)).read()
+            return_status = json.loads(data.decode('utf-8'))
+        except Exception as e:
+            logging.debug("Exception: {}".format(e))
+            logging.info("Unable to contact strand server at {}".format(STRAND_URL))
+            latest_status['lastResultStatus'] = False
+        logging.debug('Status endpoint returned: {}'.format(return_status))
 
-    def led_start(self, pattern):
-        print('Checking if lights are in a current pattern.')
-        if Process.led_pattern_process.is_alive():
-            print('Lights are in a pattern, terminating...')
-            Process.led_pattern_process.terminate()
-            Process.led_pattern_process.join()
+        latest_status = merge_dicts(latest_status,return_status)
+        logging.debug("Current status: {}".format(latest_status))
+        self.pattern = latest_status['pattern']
+        return latest_status
 
+    def send_status(self, client):
+        current_status = self.get_status()
+        mqtt_topic = self.mqtt_telemetry_topic
+        payload = current_status
+        payload = json.dumps(payload)
+        print('Publishing message \'{}\''.format(payload))
+        client.publish(mqtt_topic, payload, qos=1)
+
+    def send_config(self, config):
+        req = urllib.request.Request('{}/setpattern'.format(STRAND_URL))
+        req.add_header('Content-Type', 'application/json; charset=utf-8')
+        jsondata = json.dumps(config).encode('utf-8')
+        req.add_header('Content-Length', len(jsondata))
+        try:
+            req = urllib.request.urlopen(req, jsondata)
+            logging.debug("Server response: {}".format(req.getcode()))
+
+        except Exception as e:
+            logging.debug("Exception: {}".format(e))
+            logging.info("Unable to contact strand server at {}".format(STRAND_URL))
+
+        if req.getcode() != 200:
+            logging.debug("Server returned an error.")
+            return False
+        else:
+            return True
+
+    def send_pattern(self, pattern):
         pattern = pattern.lower()
-        pattern = pattern.strip()
-        pattern = pattern.replace(" ", "")
+        logging.debug("Checking current pattern: {}".format(self.pattern))
+        logging.debug("Desired pattern {}".format(pattern))
+        if pattern == self.pattern:
+            logging.info("Already running {}, ignoring".format(pattern))
+            return True
+        desired_config = {
+            "pattern": pattern
+        }
+        result = self.send_config(desired_config)
+        logging.debug("Set pattern returned: {}".format(result))
 
-        print('Setting pattern to: {}'.format(pattern))
-
-        Process.led_pattern_process = multiprocessing.Process(target=self.ledpattern.run, args=(pattern,))
-        Process.led_pattern_process.start()
-
-    def led_stop(self):
-        print('Turning all LEDs off...')
-        print('Checking if lights are in a current pattern.')
-        if Process.led_pattern_process.is_alive():
-            print('Lights are in a pattern, terminating...')
-            Process.led_pattern_process.terminate()
-            Process.led_pattern_process.join()
-        print('Setting all LEDs off')
-        Process.led_pattern_process = multiprocessing.Process(target=self.ledpattern.off)
-        Process.led_pattern_process.start()
 
 def wait_for_connection(timeout):
     """Wait for the device to become connected."""
@@ -112,12 +158,15 @@ def on_connect(unused_client, unused_userdata, unused_flags, rc):
 def on_disconnect(client, userdata, rc):
     """Callback for when a device disconnects."""
     print('Disconnected: {} {}', error_str(rc), userdata)
+    global client_connected
     client_connected = False
     client.loop_stop()
+    print("We have become disconnected, trying to reconnect.")
 
 
 def on_publish(unused_client, unused_userdata, unused_mid):
     """Callback when the device receives a PUBACK from the MQTT bridge."""
+    device.lastack = datetime.datetime.utcnow()
     if DEBUG:
         print('Published message acked.')
 
@@ -130,30 +179,19 @@ def on_subscribe(unused_client, unused_userdata, unused_mid,
 
 def on_message(unused_client, unused_userdata, message):
     """Callback when the device receives a message on a subscription."""
-    payload = message.payload
-    print('Received message \'{}\' on topic \'{}\' with Qos {}'.format(
+    payload = message.payload.decode('utf-8')
+    logging.debug('Received message \'{}\' on topic \'{}\' with Qos {}'.format(
         payload, message.topic, str(message.qos)))
 
-    # The device will receive its latest config when it subscribes to the
-    # config topic. If there is no configuration for the device, the device
-    # will receive a config with an empty payload.
     if not payload:
-        return
+        return False
 
-    # The config is passed in the payload of the message. In this example,
-    # the server sends a serialized JSON string.
     data = json.loads(payload)
-    device = Device()
-    if data['led_on']:
-        Device.led_start(device, data['pattern'])
-    elif not data['led_on']:
-        Device.led_stop(device)
+
+    device.send_pattern(data['pattern'])
 
 def on_log(client, userdata, level, buf):
     print("{} Client log: {}", datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f"), buf)
-
-
-
 
 
 def parse_command_line_args():
@@ -238,7 +276,7 @@ def get_client(
     client.on_log = on_log
 
     # Connect to the Google MQTT bridge.
-    client.connect(mqtt_bridge_hostname, mqtt_bridge_port)
+    client.connect(mqtt_bridge_hostname, mqtt_bridge_port, keepalive=60)
 
     # This is the topic that the device will receive configuration updates on.
     mqtt_config_topic = '/devices/{}/config'.format(device_id)
@@ -248,13 +286,55 @@ def get_client(
 
     return client
 
+def client_connection(client,args,jwtIssued):
+    # Wait if backoff is required.
+    if should_backoff:
+        # If backoff time is too large, give up.
+        if minimum_backoff_time > MAXIMUM_BACKOFF_TIME:
+            print('Exceeded maximum backoff time. Giving up.')
+            return False
+
+        # Otherwise, wait and connect again.
+        delay = minimum_backoff_time + time.random.randint(0, 1000) / 1000.0
+        print('Waiting for {} before reconnecting.'.format(delay))
+        time.sleep(delay)
+        minimum_backoff_time *= 2
+        client.connect(args.mqtt_bridge_hostname, args.mqtt_bridge_port)
+
+    # Watching for last ack because disconnection detection doesnt work.
+    seconds_since_ack = (abs(datetime.datetime.utcnow() - device.lastack)).total_seconds()
+
+    seconds_since_issue = (datetime.datetime.utcnow() - jwtIssued).seconds
+    if DEBUG:
+        print("JWT is {} seconds old.".format(seconds_since_issue))
+        print("Last ACK was: {}, {} seconds ago.".format(device.lastack, seconds_since_ack))
+
+    if seconds_since_ack > MAX_TIME_BETWEEN_ACKS:
+        print('Last ACK was {} seconds ago, MAX_TIME_BETWEEN_ACKS: {}'.format(seconds_since_ack, MAX_TIME_BETWEEN_ACKS))
+        main()
+    elif seconds_since_issue > 60 * jwt_exp_mins:
+        print('Refreshing token after {}s').format(seconds_since_issue)
+        client.loop_stop()
+        jwtIssued = datetime.datetime.utcnow()
+        client = get_client(
+            args.project_id, args.cloud_region,
+            args.registry_id, args.device_id, args.private_key_file,
+            args.algorithm, args.ca_certs, args.mqtt_bridge_hostname,
+            args.mqtt_bridge_port)
+        client.loop_start()
 
 def main():
     args = parse_command_line_args()
 
+    global device
+    device = Device()
+    device.registry_id = args.registry_id
+    device.device_id = args.device_id
+    device.mqtt_telemetry_topic = '/devices/{}/state'.format(args.device_id)
+
     global minimum_backoff_time
 
-    mqtt_telemetry_topic = '/devices/{}/state'.format(args.device_id)
+
 
     # This is the topic that the device will receive configuration updates on.
     mqtt_config_topic = '/devices/{}/config'.format(args.device_id)
@@ -265,38 +345,18 @@ def main():
         args.private_key_file, args.algorithm, args.ca_certs,
         args.mqtt_bridge_hostname, args.mqtt_bridge_port)
 
-    # Publish num_messages mesages to the MQTT bridge once per second.
+    device.get_status()
+
+
+    client.loop_start()
+
+
+
     while True:
-        # Process network events.
-        client.loop_start()
 
-        # Wait if backoff is required.
-        if should_backoff:
-            # If backoff time is too large, give up.
-            if minimum_backoff_time > MAXIMUM_BACKOFF_TIME:
-                print('Exceeded maximum backoff time. Giving up.')
-                break
-
-            # Otherwise, wait and connect again.
-            delay = minimum_backoff_time + time.random.randint(0, 1000) / 1000.0
-            print('Waiting for {} before reconnecting.'.format(delay))
-            time.sleep(delay)
-            minimum_backoff_time *= 2
-            client.connect(args.mqtt_bridge_hostname, args.mqtt_bridge_port)
-
-        seconds_since_issue = (datetime.datetime.utcnow() - jwtIssued).seconds
-        if seconds_since_issue > 60 * jwt_exp_mins:
-            print('Refreshing token after {}s').format(seconds_since_issue)
-            client.loop_stop()
-            jwtIssued = datetime.datetime.utcnow()
-            client = get_client(
-                args.project_id, args.cloud_region,
-                args.registry_id, args.device_id, args.private_key_file,
-                args.algorithm, args.ca_certs, args.mqtt_bridge_hostname,
-                args.mqtt_bridge_port)
-
-        # Send events every second. State should not be updated as often
-        time.sleep(5)
+        client_connection(client, args, jwtIssued)
+        device.send_status(client)
+        time.sleep(30)
 
     print('Finished.')
 

@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-# NeoPixel library strandtest example
-# Author: Tony DiCola (tony@tonydicola.com)
-#
-# Direct port of the Arduino NeoPixel library strandtest example.  Showcases
-# various animations on a strip of NeoPixels.
+
 
 import time
 from neopixel import *
 import argparse
 import random
-import math
+from flask import Flask, abort, request
+import sys
+import json
+import threading
+import inspect
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import signal
+
+logging.basicConfig(level="DEBUG")
+
+
 
 # LED strip configuration:
 LED_COUNT      = 476
@@ -239,16 +246,73 @@ def showColors(pixels, colors):
     pixels.show()
 
 
-
-
-class Pattern(object):
+class LED(object):
 
     def __init__(self):
         self.strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
         self.strip.begin()
 
+        self.pattern = None
+        self.led_on = None
+
+        # self.thread = threading.Thread()
+        self.pool = ThreadPoolExecutor(1)
+        self.stopper = threading.Event()
+        self.future = None
+
+        signal.signal(signal.SIGALRM, self.stop_pattern)
+
+
+
+
+    def get_status(self):
+        return {"pattern": self.pattern, "led_on": self.led_on}
+
+    def stop_pattern(self, num, stack):
+        print("Received SIGALRM")
+        raise Exception("STOP")
+
+    def run_pattern(self, pattern):
+        currentstatus = self.get_status()
+        if currentstatus['pattern'] == pattern:
+            print("Already running: {}".format(pattern))
+            return True
+        if pattern not in dir(self):
+            print("Pattern not found.")
+            return False
+
+        print("Sending pattern: {}".format(pattern))
+        func = getattr(self, pattern)
+
+        try:
+            if self.future.running():
+                self.stopper.set()
+                signal.alarm(1)
+                logging.debug("Stopping current process.")
+                while not self.future.done():
+                    logging.debug("Waiting for current pattern to stop.")
+                    time.sleep(0.5)
+        except Exception as e:
+            logging.debug(e)
+
+        self.stopper.clear()
+        self.future = self.pool.submit(func)
+
+
+        #logging.debug("Result: {}".format(future.result()))
+        #
+        #     print("Currently running {}...stopping.".format(self.pattern))
+        #     self.stopper.set()
+        #     self.thread.join(5)
+        # self.thread = threading.currentThread(target=func)
+        # self.thread.start()
+
+
+
     def test(self):
-        while True:
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
+        try:
             print('Color wipe animations.')
             colorWipe(self.strip, Color(255, 0, 0))  # Red wipe
             colorWipe(self.strip, Color(0, 255, 0))  # Blue wipe
@@ -261,97 +325,176 @@ class Pattern(object):
             rainbow(self.strip)
             rainbowCycle(self.strip)
             theaterChaseRainbow(self.strip)
+        except Exception as ex:
+            logging.debug("Stopped.")
+        finally:
+            signal.alarm(0)
 
     def theater(self):
-        while True:
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
+        while not self.stopper.is_set():
             print('Theater chase animations.')
             theaterChase(self.strip, Color(127, 127, 127))  # White theater chase
             theaterChase(self.strip, Color(127, 0, 0))  # Red theater chase
             theaterChase(self.strip, Color(0, 0, 127))  # Blue theater chase
 
     def rainbow(self):
-        while True:
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
+        while not self.stopper.is_set():
             print('Rainbow')
             rainbowCycle(self.strip)
+        return True
 
     def red(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting red.")
         solid(self.strip, Color(0,255,0))
 
     def blue(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting blue.")
         solid(self.strip, Color(0,0,255))
 
     def white(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
+        self.pattern = "white"
+        self.led_on = True
         print("Setting white.")
         solid(self.strip, Color(127,127,127))
+        return True
 
     def christmas(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting christmas.")
         alternate(self.strip,Color(0,255,0),Color(255,0,0))
 
     def nicaragua(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting nicaragua.")
         alternate(self.strip,Color(0,0,127),Color(127,127,127))
 
     def canada(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting canada.")
         alternate(self.strip,Color(0,127,0),Color(127,127,127))
 
     def burst(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Setting burst.")
-        runBurst(self.strip)
+        t = 0
+        colorBurst = None
+        colorBurst2 = None
+        # colorParticle = ColorParticle(wheel(0), 30*2, strip.numPixels()/2, 2, 0, 0.05)
+        while not self.stopper.is_set():
+            if t % 40 == 0:
+                colorBurst = ColorBurst(random.randint(0, self.strip.numPixels() - 1), random.randint(0, 255), 20,
+                                        random.randint(20, 35), 3, 0.05, 30 / 3, 30 * 1)
+            if t == 0 or t % 40 == 30:
+                colorBurst2 = ColorBurst(random.randint(0, self.strip.numPixels() - 1), random.randint(0, 255), 20,
+                                         random.randint(20, 35), 3, 0.05, 30 / 3, 30 * 1)
+            colors = [0] * self.strip.numPixels()
+            setArrayValues(colors, colorBurst.simulate(t % 40), False)
+            setArrayValues(colors, colorBurst2.simulate((t - 30) % 40), False)
+            # setArrayValues(colors, [colorParticle.simulate(t)], True)
+            showColors(self.strip, colors)
+
+            t += 1
+            time.sleep(1 / 60)
 
     def knightrider(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = True
         print("Knight rider!!")
-
         nightrider(self.strip)
 
     def off(self):
+        self.pattern = inspect.stack()[0][3]
+        self.led_on = False
         for i in range(1, 3):
             colorWipe(self.strip, Color(0, 0, 0), 10)
+        return True
 
-    def run(self, pattern):
-        print("Running pattern: {}".format(pattern))
-        func = getattr(Pattern, pattern)
-        try:
-            func(self)
-        except Exception as e:
-            print(e)
-            print("Pattern not found.")
+
+
+
+app = Flask(__name__)
+@app.route('/status')
+def status():
+    currentstatus = LEDStrip.get_status()
+    print("Status: {}".format(currentstatus))
+    return json.dumps(currentstatus)
+
+@app.route('/setpattern', methods=['POST'])
+def setpattern():
+    reqjson = request.get_json()
+    print("Request: {}".format(reqjson))
+
+    try:
+        pattern = reqjson['pattern']
+
+    except Exception as e:
+        print(e)
+        abort(400)
+
+    print("Setting pattern to: {}".format(pattern))
+    pattern_result = LEDStrip.run_pattern(pattern)
+    result = {"result": pattern_result, "pattern": pattern}
+    return json.dumps(result)
+
+
 
 # Main program logic follows:
 if __name__ == '__main__':
     # Process arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--clear', action='store_true', help='clear the display on exit')
+    parser.add_argument('-t', '--test', action='store_true', help='Run strand test and exit.')
+    parser.add_argument('-c', '--clear', action='store_true', help='Clear strip')
     args = parser.parse_args()
 
-    # Create NeoPixel object with appropriate configuration.
-    strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
-    # Intialize the library (must be called once before other functions).
-    strip.begin()
+    if args.test:
+        print('Press Ctrl-C to quit.')
 
-    print ('Press Ctrl-C to quit.')
-    if not args.clear:
-        print('Use "-c" argument to clear LEDs on exit')
+        strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
+        strip.begin()
 
-    try:
+        try:
+            while True:
+                print('Color wipe animations.')
+                colorWipe(strip, Color(255, 0, 0))  # Red wipe
+                colorWipe(strip, Color(0, 255, 0))  # Blue wipe
+                colorWipe(strip, Color(0, 0, 255))  # Green wipe
+                print('Theater chase animations.')
+                theaterChase(strip, Color(127, 127, 127))  # White theater chase
+                theaterChase(strip, Color(127, 0, 0))  # Red theater chase
+                theaterChase(strip, Color(0, 0, 127))  # Blue theater chase
+                print('Rainbow animations.')
+                rainbow(strip)
+                rainbowCycle(strip)
+                theaterChaseRainbow(strip)
 
-        while True:
-            print ('Color wipe animations.')
-            colorWipe(strip, Color(255, 0, 0))  # Red wipe
-            colorWipe(strip, Color(0, 255, 0))  # Blue wipe
-            colorWipe(strip, Color(0, 0, 255))  # Green wipe
-            print ('Theater chase animations.')
-            theaterChase(strip, Color(127, 127, 127))  # White theater chase
-            theaterChase(strip, Color(127,   0,   0))  # Red theater chase
-            theaterChase(strip, Color(  0,   0, 127))  # Blue theater chase
-            print ('Rainbow animations.')
-            rainbow(strip)
-            rainbowCycle(strip)
-            theaterChaseRainbow(strip)
+        except KeyboardInterrupt:
 
-    except KeyboardInterrupt:
-        if args.clear:
-            colorWipe(strip, Color(0,0,0), 10)
+            colorWipe(strip, Color(0, 0, 0), 10)
+            sys.exit(0)
+
+    elif args.clear:
+        print("Clearing strip.")
+        strip = Adafruit_NeoPixel(LED_COUNT, LED_PIN, LED_FREQ_HZ, LED_DMA, LED_INVERT, LED_BRIGHTNESS, LED_CHANNEL)
+        strip.begin()
+        colorWipe(strip, Color(0, 0, 0), 10)
+        sys.exit(0)
+
+
+    else:
+        LEDStrip = LED()
+        LEDStrip.run_pattern("off")
+        app.run()
